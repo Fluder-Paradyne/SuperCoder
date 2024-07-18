@@ -13,6 +13,7 @@ func GetConnectionUpgrader(
 	maxBufferSizeBytes int,
 ) websocket.Upgrader {
 	return websocket.Upgrader{
+		EnableCompression: true,
 		CheckOrigin: func(r *http.Request) bool {
 			requesterHostname := r.Host
 			if strings.Index(requesterHostname, ":") != -1 {

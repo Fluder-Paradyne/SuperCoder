@@ -50,6 +50,45 @@ type TerminalController struct {
 	cancelFunc                  context.CancelFunc
 	writeMutex                  sync.Mutex
 	historyBuffer               bytes.Buffer
+	broadcaster                 *Broadcaster
+}
+
+type Broadcaster struct {
+	subscribers map[chan []byte]struct{}
+	mu          sync.RWMutex
+}
+
+func NewBroadcaster() *Broadcaster {
+	return &Broadcaster{
+		subscribers: make(map[chan []byte]struct{}),
+	}
+}
+
+func (b *Broadcaster) Subscribe() chan []byte {
+	ch := make(chan []byte, 100)
+	b.mu.Lock()
+	b.subscribers[ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *Broadcaster) Unsubscribe(ch chan []byte) {
+	b.mu.Lock()
+	delete(b.subscribers, ch)
+	close(ch)
+	b.mu.Unlock()
+}
+
+func (b *Broadcaster) Broadcast(data []byte) {
+	b.mu.RLock()
+	for ch := range b.subscribers {
+		select {
+		case ch <- data:
+		default:
+			// If the channel is full, skip this subscriber
+		}
+	}
+	b.mu.RUnlock()
 }
 
 func NewTerminalController(logger *zap.Logger, command string, arguments []string, allowedHostnames []string) (*TerminalController, error) {
@@ -60,7 +99,7 @@ func NewTerminalController(logger *zap.Logger, command string, arguments []strin
 		return nil, err
 	}
 	ttyBuffer := bytes.Buffer{}
-	return &TerminalController{
+	controller := &TerminalController{
 		DefaultConnectionErrorLimit: 10,
 		MaxBufferSizeBytes:          1024,
 		KeepalivePingTimeout:        20 * time.Second,
@@ -71,7 +110,12 @@ func NewTerminalController(logger *zap.Logger, command string, arguments []strin
 		AllowedHostnames:            allowedHostnames,
 		logger:                      logger,
 		historyBuffer:               ttyBuffer,
-	}, nil
+		broadcaster:                 NewBroadcaster(),
+	}
+
+	go controller.centralTTYReader()
+
+	return controller, nil
 }
 
 func (controller *TerminalController) RunCommand(ctx *gin.Context) {
@@ -187,52 +231,54 @@ func (controller *TerminalController) keepAlive(ctx context.Context, connection 
 	}
 }
 
+func (controller *TerminalController) centralTTYReader() {
+	buffer := make([]byte, controller.MaxBufferSizeBytes)
+	for {
+		readLength, err := controller.tty.Read(buffer)
+		if err != nil {
+			controller.logger.Warn("failed to read from tty", zap.Error(err))
+			return
+		}
+
+		data := make([]byte, readLength)
+		copy(data, buffer[:readLength])
+
+		controller.broadcaster.Broadcast(data)
+
+		// save to history buffer
+		controller.writeMutex.Lock()
+		controller.historyBuffer.Write(data)
+		controller.writeMutex.Unlock()
+	}
+}
+
 func (controller *TerminalController) readFromTTY(ctx context.Context, connection *websocket.Conn, waiter *sync.WaitGroup) {
 	defer func() {
 		waiter.Done()
 		controller.logger.Info("readFromTTY goroutine exiting...")
 	}()
-	errorCounter := 0
-	buffer := make([]byte, controller.MaxBufferSizeBytes)
+
+	ch := controller.broadcaster.Subscribe()
+	defer controller.broadcaster.Unsubscribe(ch)
+
 	for {
 		select {
 		case <-ctx.Done():
 			controller.logger.Info("done reading from tty...")
 			return
-		default:
-
-			readLength, err := controller.tty.Read(buffer)
-			if err != nil {
-				controller.logger.Warn("failed to read from tty", zap.Error(err))
-				controller.writeMutex.Lock()
-				if err := connection.WriteMessage(websocket.TextMessage, []byte("bye!")); err != nil {
-					controller.logger.Warn("failed to send termination message from tty to xterm.js", zap.Error(err))
-				}
-				controller.writeMutex.Unlock()
-				return
-			}
-
+		case data := <-ch:
 			controller.writeMutex.Lock()
-			// save to history buffer
-			controller.historyBuffer.Write(buffer[:readLength])
-			if err := connection.WriteMessage(websocket.BinaryMessage, buffer[:readLength]); err != nil {
+			if err := connection.WriteMessage(websocket.BinaryMessage, data); err != nil {
 				controller.writeMutex.Unlock()
-				controller.logger.Warn(fmt.Sprintf("failed to send %v bytes from tty to xterm.js", readLength), zap.Int("read_length", readLength), zap.Error(err))
-				errorCounter++
-				if errorCounter > controller.ConnectionErrorLimit {
-					return
-				}
+				controller.logger.Warn("failed to send data from tty to xterm.js", zap.Error(err))
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					controller.logger.Info("WebSocket closed by client")
 					controller.cancelFunc()
-					return
 				}
-				continue
+				return
 			}
 			controller.writeMutex.Unlock()
 
-			controller.logger.Info(fmt.Sprintf("sent message of size %v bytes from tty to xterm.js", readLength), zap.Int("read_length", readLength))
-			errorCounter = 0
+			controller.logger.Info("sent message from tty to xterm.js", zap.Int("length", len(data)))
 		}
 	}
 }
